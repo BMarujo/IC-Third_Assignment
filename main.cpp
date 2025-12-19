@@ -57,7 +57,7 @@ void unshuffle_bf16(const uint8_t* src, uint8_t* dst, size_t size) {
     }
 }
 
-void compress(const std::string& input_path, const std::string& output_path) {
+void compress(const std::string& input_path, const std::string& output_path, int compression_level = 15) {
     std::cout << "Opening input and output streams..." << std::endl;
     std::ifstream input(input_path, std::ios::binary);
     if (!input) throw std::runtime_error("Cannot open file: " + input_path);
@@ -88,7 +88,7 @@ void compress(const std::string& input_path, const std::string& output_path) {
 
     size_t total_in = 0;
     size_t total_out = sizeof(header_size) + header_size;
-    int compression_level = 15;
+    // `compression_level` is provided by caller (default 15)
 
     std::cout << "Processing chunks of " << CHUNK_SIZE << " bytes..." << std::endl;
     Timer t_total;
@@ -216,17 +216,26 @@ void decompress(const std::string& input_path, const std::string& output_path) {
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        std::cerr << "Usage: " << argv[0] << " <compress|decompress> <input> <output>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <compress|decompress> <input> <output> [compression_level]" << std::endl;
         return 1;
     }
     
     std::string mode = argv[1];
     std::string input = argv[2];
     std::string output = argv[3];
+    int compression_level = 15;
+    if (mode == "compress" && argc >= 5) {
+        try {
+            compression_level = std::stoi(argv[4]);
+        } catch (const std::exception& e) {
+            std::cerr << "Invalid compression level: " << argv[4] << std::endl;
+            return 1;
+        }
+    }
     
     try {
         if (mode == "compress") {
-            compress(input, output);
+            compress(input, output, compression_level);
         } else if (mode == "decompress") {
             decompress(input, output);
         } else {
