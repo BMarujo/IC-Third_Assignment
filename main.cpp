@@ -4,8 +4,11 @@
 #include <string>
 #include <cstring>
 #include <chrono>
+#include <cstdint>
 #include <zstd.h>
 #include <stdexcept>
+
+constexpr size_t CHUNK_SIZE = 32 * 1024 * 1024; // 32MB blocks to limit memory
 
 // Helper to measure time
 class Timer {
@@ -19,22 +22,18 @@ public:
     }
 };
 
-// Function to read file into buffer
-std::vector<uint8_t> read_file(const std::string& filename) {
-    std::ifstream file(filename, std::ios::binary | std::ios::ate);
-    if (!file) throw std::runtime_error("Cannot open file: " + filename);
-    std::streamsize size = file.tellg();
-    file.seekg(0, std::ios::beg);
-    std::vector<uint8_t> buffer(size);
-    if (!file.read((char*)buffer.data(), size)) throw std::runtime_error("Read error");
-    return buffer;
+void write_uint64(std::ofstream& out, uint64_t value) {
+    out.write(reinterpret_cast<const char*>(&value), sizeof(value));
+    if (!out) throw std::runtime_error("Write error while writing uint64");
 }
 
-// Function to write buffer to file
-void write_file(const std::string& filename, const std::vector<uint8_t>& buffer) {
-    std::ofstream file(filename, std::ios::binary);
-    if (!file) throw std::runtime_error("Cannot open output file: " + filename);
-    file.write((const char*)buffer.data(), buffer.size());
+bool read_uint64(std::ifstream& in, uint64_t& value) {
+    in.read(reinterpret_cast<char*>(&value), sizeof(value));
+    if (in.gcount() == 0) return false; // EOF
+    if (in.gcount() != static_cast<std::streamsize>(sizeof(value))) {
+        throw std::runtime_error("Unexpected EOF while reading uint64");
+    }
+    return true;
 }
 
 // Shuffle function for BF16 (2 bytes)
@@ -59,104 +58,159 @@ void unshuffle_bf16(const uint8_t* src, uint8_t* dst, size_t size) {
 }
 
 void compress(const std::string& input_path, const std::string& output_path) {
-    std::cout << "Loading " << input_path << "..." << std::endl;
-    auto raw_data = read_file(input_path);
-    
-    if (raw_data.size() < 8) throw std::runtime_error("File too small");
-    
-    // Parse Header Size (Little Endian uint64)
+    std::cout << "Opening input and output streams..." << std::endl;
+    std::ifstream input(input_path, std::ios::binary);
+    if (!input) throw std::runtime_error("Cannot open file: " + input_path);
+    std::ofstream output(output_path, std::ios::binary);
+    if (!output) throw std::runtime_error("Cannot open output file: " + output_path);
+
     uint64_t header_size = 0;
-    memcpy(&header_size, raw_data.data(), 8);
-    
+    input.read(reinterpret_cast<char*>(&header_size), sizeof(header_size));
+    if (input.gcount() != static_cast<std::streamsize>(sizeof(header_size))) {
+        throw std::runtime_error("File too small to contain header size");
+    }
+
+    std::vector<uint8_t> header(header_size);
+    if (!input.read(reinterpret_cast<char*>(header.data()), header_size)) {
+        throw std::runtime_error("Failed to read header");
+    }
+
     std::cout << "Header Size: " << header_size << std::endl;
     
-    size_t data_offset = 8 + header_size;
-    if (raw_data.size() < data_offset) throw std::runtime_error("File smaller than header implies");
-    
-    size_t data_len = raw_data.size() - data_offset;
-    std::cout << "Data Size: " << data_len << " bytes" << std::endl;
-    
-    std::vector<uint8_t> processed_data(raw_data.size());
-    
-    // Copy Header Size and Header as is
-    memcpy(processed_data.data(), raw_data.data(), data_offset);
-    
-    // Shuffle Data
-    std::cout << "Shuffling BF16 data..." << std::endl;
-    Timer t_shuffle;
-    shuffle_bf16(raw_data.data() + data_offset, processed_data.data() + data_offset, data_len);
-    std::cout << "Shuffle time: " << t_shuffle.elapsed() << "s" << std::endl;
-    
-    // Compress
-    std::cout << "Compressing with Zstd..." << std::endl;
-    size_t max_dst_size = ZSTD_compressBound(processed_data.size());
-    std::vector<uint8_t> compressed_data(max_dst_size);
-    
-    Timer t_compress;
-    int compression_level = 15; 
-    
-    // Simple API
-    size_t c_size = ZSTD_compress(compressed_data.data(), max_dst_size, 
-                                  processed_data.data(), processed_data.size(), 
-                                  compression_level);
-    
-    if (ZSTD_isError(c_size)) {
-        throw std::runtime_error(std::string("Zstd error: ") + ZSTD_getErrorName(c_size));
+    // Write header size and header uncompressed so decompression can stream
+    write_uint64(output, header_size);
+    output.write(reinterpret_cast<const char*>(header.data()), header_size);
+    if (!output) throw std::runtime_error("Failed to write header to output");
+
+    std::vector<uint8_t> raw_chunk(CHUNK_SIZE);
+    std::vector<uint8_t> shuffled_chunk(CHUNK_SIZE);
+    std::vector<uint8_t> compressed_chunk;
+
+    size_t total_in = 0;
+    size_t total_out = sizeof(header_size) + header_size;
+    int compression_level = 15;
+
+    std::cout << "Processing chunks of " << CHUNK_SIZE << " bytes..." << std::endl;
+    Timer t_total;
+
+    while (true) {
+        input.read(reinterpret_cast<char*>(raw_chunk.data()), raw_chunk.size());
+        std::streamsize bytes_read = input.gcount();
+        if (bytes_read == 0) break;
+        if (bytes_read % 2 != 0) throw std::runtime_error("Data size must be even for BF16 shuffle");
+
+        uint64_t chunk_size = static_cast<uint64_t>(bytes_read);
+        shuffled_chunk.resize(bytes_read);
+
+        shuffle_bf16(raw_chunk.data(), shuffled_chunk.data(), bytes_read);
+
+        size_t max_dst_size = ZSTD_compressBound(chunk_size);
+        compressed_chunk.resize(max_dst_size);
+        size_t c_size = ZSTD_compress(compressed_chunk.data(), max_dst_size,
+                                      shuffled_chunk.data(), chunk_size,
+                                      compression_level);
+
+        if (ZSTD_isError(c_size)) {
+            throw std::runtime_error(std::string("Zstd error: ") + ZSTD_getErrorName(c_size));
+        }
+
+        write_uint64(output, chunk_size);
+        write_uint64(output, static_cast<uint64_t>(c_size));
+        output.write(reinterpret_cast<const char*>(compressed_chunk.data()), c_size);
+        if (!output) throw std::runtime_error("Failed to write compressed chunk");
+
+        total_in += static_cast<size_t>(chunk_size);
+        total_out += sizeof(uint64_t) * 2 + static_cast<size_t>(c_size);
     }
-    
-    compressed_data.resize(c_size);
-    std::cout << "Compression time: " << t_compress.elapsed() << "s" << std::endl;
-    std::cout << "Original size: " << raw_data.size() << std::endl;
-    std::cout << "Compressed size: " << c_size << std::endl;
-    std::cout << "Ratio: " << (double)raw_data.size() / c_size << "x" << std::endl;
-    
-    write_file(output_path, compressed_data);
+
+    std::cout << "Compression time: " << t_total.elapsed() << "s" << std::endl;
+    std::cout << "Original size: " << total_in + sizeof(header_size) + header_size << std::endl;
+    std::cout << "Compressed size: " << total_out << std::endl;
+    if (total_out > 0) {
+        std::cout << "Ratio: " << static_cast<double>(total_in + sizeof(header_size) + header_size) / total_out << "x" << std::endl;
+    }
     std::cout << "Saved to " << output_path << std::endl;
 }
 
 void decompress(const std::string& input_path, const std::string& output_path) {
-    std::cout << "Loading " << input_path << "..." << std::endl;
-    auto compressed_data = read_file(input_path);
-    
-    unsigned long long const r_size = ZSTD_getFrameContentSize(compressed_data.data(), compressed_data.size());
-    if (r_size == ZSTD_CONTENTSIZE_ERROR) throw std::runtime_error("Not a zstd file");
-    if (r_size == ZSTD_CONTENTSIZE_UNKNOWN) throw std::runtime_error("Unknown original size");
-    
-    std::vector<uint8_t> decompressed_data(r_size);
-    
-    std::cout << "Decompressing..." << std::endl;
-    Timer t_decompress;
-    
-    ZSTD_DCtx* dctx = ZSTD_createDCtx();
-    size_t d_size = ZSTD_decompressDCtx(dctx, decompressed_data.data(), r_size, 
-                                        compressed_data.data(), compressed_data.size());
-                                        
-    if (ZSTD_isError(d_size)) {
-        ZSTD_freeDCtx(dctx);
-        throw std::runtime_error(std::string("Zstd error: ") + ZSTD_getErrorName(d_size));
+    std::cout << "Opening compressed input..." << std::endl;
+    std::ifstream input(input_path, std::ios::binary);
+    if (!input) throw std::runtime_error("Cannot open file: " + input_path);
+    std::ofstream output(output_path, std::ios::binary);
+    if (!output) throw std::runtime_error("Cannot open output file: " + output_path);
+
+    uint64_t header_size = 0;
+    input.read(reinterpret_cast<char*>(&header_size), sizeof(header_size));
+    if (input.gcount() != static_cast<std::streamsize>(sizeof(header_size))) {
+        throw std::runtime_error("Corrupted compressed file: missing header size");
     }
+
+    std::vector<uint8_t> header(header_size);
+    if (!input.read(reinterpret_cast<char*>(header.data()), header_size)) {
+        throw std::runtime_error("Corrupted compressed file: missing header data");
+    }
+
+    // Write header back to reconstructed file
+    write_uint64(output, header_size);
+    output.write(reinterpret_cast<const char*>(header.data()), header_size);
+    if (!output) throw std::runtime_error("Failed to write header to output");
+
+    std::vector<uint8_t> compressed_chunk;
+    std::vector<uint8_t> shuffled_chunk;
+    std::vector<uint8_t> final_chunk;
+
+    size_t total_out = sizeof(header_size) + header_size;
+    ZSTD_DCtx* dctx = ZSTD_createDCtx();
+    if (!dctx) throw std::runtime_error("Failed to create ZSTD_DCtx");
+
+    Timer t_decompress;
+    while (true) {
+        uint64_t chunk_size = 0;
+        uint64_t compressed_size = 0;
+
+        if (!read_uint64(input, chunk_size)) break; // EOF reached cleanly
+        if (!read_uint64(input, compressed_size)) {
+            ZSTD_freeDCtx(dctx);
+            throw std::runtime_error("Corrupted compressed file: missing compressed size");
+        }
+        if (chunk_size % 2 != 0) {
+            ZSTD_freeDCtx(dctx);
+            throw std::runtime_error("Corrupted chunk: size not even for BF16");
+        }
+
+        compressed_chunk.resize(static_cast<size_t>(compressed_size));
+        if (!input.read(reinterpret_cast<char*>(compressed_chunk.data()), compressed_size)) {
+            ZSTD_freeDCtx(dctx);
+            throw std::runtime_error("Corrupted compressed file: truncated chunk data");
+        }
+
+        shuffled_chunk.resize(static_cast<size_t>(chunk_size));
+        size_t d_size = ZSTD_decompressDCtx(dctx,
+                                            shuffled_chunk.data(), chunk_size,
+                                            compressed_chunk.data(), compressed_size);
+        if (ZSTD_isError(d_size)) {
+            ZSTD_freeDCtx(dctx);
+            throw std::runtime_error(std::string("Zstd error: ") + ZSTD_getErrorName(d_size));
+        }
+        if (d_size != chunk_size) {
+            ZSTD_freeDCtx(dctx);
+            throw std::runtime_error("Size mismatch after decompression");
+        }
+
+        final_chunk.resize(static_cast<size_t>(chunk_size));
+        unshuffle_bf16(shuffled_chunk.data(), final_chunk.data(), chunk_size);
+
+        output.write(reinterpret_cast<const char*>(final_chunk.data()), chunk_size);
+        if (!output) {
+            ZSTD_freeDCtx(dctx);
+            throw std::runtime_error("Write error while writing decompressed chunk");
+        }
+        total_out += static_cast<size_t>(chunk_size);
+    }
+
     ZSTD_freeDCtx(dctx);
     std::cout << "Decompression time: " << t_decompress.elapsed() << "s" << std::endl;
-    
-    uint64_t header_size = 0;
-    memcpy(&header_size, decompressed_data.data(), 8);
-    size_t data_offset = 8 + header_size;
-    size_t data_len = d_size - data_offset;
-    
-    std::cout << "Unshuffling data..." << std::endl;
-    Timer t_unshuffle;
-    
-    std::vector<uint8_t> final_data(d_size);
-    
-    // Copy header part
-    memcpy(final_data.data(), decompressed_data.data(), data_offset);
-    
-    // Unshuffle data part
-    unshuffle_bf16(decompressed_data.data() + data_offset, final_data.data() + data_offset, data_len);
-    
-    std::cout << "Unshuffle time: " << t_unshuffle.elapsed() << "s" << std::endl;
-    
-    write_file(output_path, final_data);
+    std::cout << "Restored size: " << total_out << std::endl;
     std::cout << "Saved to " << output_path << std::endl;
 }
 
