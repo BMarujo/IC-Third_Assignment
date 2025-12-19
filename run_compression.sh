@@ -5,7 +5,7 @@ echo "Building compressor..."
 make
 
 echo "Compressing model.safetensors..."
-./compressor compress model.safetensors model.safetensors.zst
+./compressor compress model.safetensors model.safetensors.zst 5
 
 echo "Decompressing to verify..."
 ./compressor decompress model.safetensors.zst model_restored.safetensors
