@@ -1,0 +1,3 @@
+compressor,input_mb,final_mb,reduction_pct,compress_s,decompress_s
+gzip -9,988.1,781.9,20.9,88.61,8.34
+xz -9e,988.1,692.0,30.0,445.04,10.91
